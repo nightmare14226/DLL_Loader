@@ -73,6 +73,11 @@ DWORD WINAPI loadLibrary(LoaderData* loaderData)
     if (!loaderData || !loaderData->imageBase)
         return FALSE;
     
+    // Validate function pointers before using them
+    if (!loaderData->loadLibraryA || !loaderData->getProcAddress) {
+        return FALSE;
+    }
+    
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)loaderData->imageBase;
     if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE)
         return FALSE;
@@ -142,6 +147,11 @@ DWORD WINAPI loadLibrary(LoaderData* loaderData)
             }
 
             PCSTR moduleName = (PCSTR)(loaderData->imageBase + importDirectory->Name);
+            
+            // Validate module name pointer
+            if (!moduleName || (DWORD_PTR)moduleName < (DWORD_PTR)loaderData->imageBase)
+                return FALSE;
+            
             HMODULE module = loaderData->loadLibraryA(moduleName);
 
             if (!module)
@@ -177,8 +187,16 @@ DWORD WINAPI loadLibrary(LoaderData* loaderData)
     // Call DLL entry point (DllMain)
     DWORD entryPoint = ntHeaders->OptionalHeader.AddressOfEntryPoint;
     if (entryPoint) {
+        // Validate entry point is within image bounds
+        if (entryPoint >= ntHeaders->OptionalHeader.SizeOfImage)
+            return FALSE;
+        
         typedef BOOL (WINAPI *DllEntryProc)(HINSTANCE, DWORD, LPVOID);
         DllEntryProc DllEntry = (DllEntryProc)(loaderData->imageBase + entryPoint);
+        
+        // Validate function pointer
+        if (!DllEntry)
+            return FALSE;
         
         // Call DLL entry point with DLL_PROCESS_ATTACH
         // This will execute all code in DllMain when ul_reason == DLL_PROCESS_ATTACH
@@ -470,6 +488,14 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     loaderParams.rtlZeroMemory = (VOID(NTAPI*)(PVOID, SIZE_T))((PBYTE)hNtdll + rtlZeroMemory_RVA);
     
     // Verify the addresses are valid (basic sanity check)
+    printf("Verifying function addresses...\n");
+    printf("  kernel32.dll base: 0x%p\n", hKernel32);
+    printf("  ntdll.dll base: 0x%p\n", hNtdll);
+    printf("  LoadLibraryA RVA: 0x%p -> 0x%p\n", (void*)loadLibraryA_RVA, (void*)loaderParams.loadLibraryA);
+    printf("  GetProcAddress RVA: 0x%p -> 0x%p\n", (void*)getProcAddress_RVA, (void*)loaderParams.getProcAddress);
+    printf("  RtlZeroMemory RVA: 0x%p -> 0x%p\n", (void*)rtlZeroMemory_RVA, (void*)loaderParams.rtlZeroMemory);
+    
+    // More thorough validation
     if ((DWORD_PTR)loaderParams.loadLibraryA < (DWORD_PTR)hKernel32 ||
         (DWORD_PTR)loaderParams.getProcAddress < (DWORD_PTR)hKernel32 ||
         (DWORD_PTR)loaderParams.rtlZeroMemory < (DWORD_PTR)hNtdll) {
@@ -480,6 +506,20 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         MessageBoxA(NULL, "Invalid function addresses calculated.", "Error", MB_OK | MB_ICONERROR);
         return 1;
     }
+    
+    // Check if addresses are within reasonable bounds (within 16MB of base)
+    if ((DWORD_PTR)loaderParams.loadLibraryA > (DWORD_PTR)hKernel32 + 0x1000000 ||
+        (DWORD_PTR)loaderParams.getProcAddress > (DWORD_PTR)hKernel32 + 0x1000000 ||
+        (DWORD_PTR)loaderParams.rtlZeroMemory > (DWORD_PTR)hNtdll + 0x1000000) {
+        VirtualFreeEx(process, executableImage, 0, MEM_RELEASE);
+        CloseHandle(process);
+        free(buffer);
+        free(binary);
+        MessageBoxA(NULL, "Function addresses out of reasonable bounds.", "Error", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    
+    printf("Function addresses validated successfully\n");
 
     // Write loader data structure
     printf("Writing loader data structure...\n");
@@ -556,17 +596,63 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     GetExitCodeThread(hThread, &exitCode);
     CloseHandle(hThread);
     
-    printf("Loader thread completed with exit code: %d\n", exitCode);
+    printf("Loader thread completed with exit code: %d (0x%08X)\n", exitCode, exitCode);
     
     // Clean up loader memory
     VirtualFreeEx(process, loaderMemory, 0, MEM_RELEASE);
     
-    if (!exitCode) {
+    // Interpret exit code
+    if (exitCode == 0) {
+        // FALSE - loader returned failure
         VirtualFreeEx(process, executableImage, 0, MEM_RELEASE);
         CloseHandle(process);
         free(buffer);
         free(binary);
-        MessageBoxA(NULL, "DLL loader failed in target process. Check if DLL is valid and compatible.", "Error", MB_OK | MB_ICONERROR);
+        MessageBoxA(NULL, 
+            "DLL loader returned FALSE.\n\n"
+            "Possible causes:\n"
+            "- Import resolution failed\n"
+            "- DllMain returned FALSE\n"
+            "- Invalid DLL structure",
+            "Error - Loader Failed", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    else if (exitCode == 0xC0000005 || exitCode == (DWORD)0xC0000005) {
+        // STATUS_ACCESS_VIOLATION - Memory access violation
+        VirtualFreeEx(process, executableImage, 0, MEM_RELEASE);
+        CloseHandle(process);
+        free(buffer);
+        free(binary);
+        CHAR errorMsg[512];
+        sprintf_s(errorMsg, sizeof(errorMsg),
+            "DLL loader crashed with ACCESS VIOLATION (0x%08X).\n\n"
+            "This means the loader tried to access invalid memory.\n\n"
+            "Common causes:\n"
+            "1. Invalid function pointers (LoadLibraryA/GetProcAddress)\n"
+            "2. DLL architecture mismatch (32-bit vs 64-bit)\n"
+            "3. Invalid PE structure in DLL\n"
+            "4. Relocation issues\n"
+            "5. DllMain is crashing\n\n"
+            "Check:\n"
+            "- DLL matches target process architecture\n"
+            "- DLL is properly encrypted/decrypted\n"
+            "- DLL doesn't have unusual dependencies",
+            exitCode);
+        MessageBoxA(NULL, errorMsg, "Error - Access Violation", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    else if (exitCode != 1 && exitCode != TRUE) {
+        // Other error codes
+        VirtualFreeEx(process, executableImage, 0, MEM_RELEASE);
+        CloseHandle(process);
+        free(buffer);
+        free(binary);
+        CHAR errorMsg[256];
+        sprintf_s(errorMsg, sizeof(errorMsg),
+            "DLL loader failed with exit code: %d (0x%08X)\n\n"
+            "This indicates an error during DLL loading.",
+            exitCode, exitCode);
+        MessageBoxA(NULL, errorMsg, "Error - Loader Failed", MB_OK | MB_ICONERROR);
         return 1;
     }
     
